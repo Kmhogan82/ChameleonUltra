@@ -1,0 +1,136 @@
+name: Firmware build
+
+on:
+  push:
+
+jobs:
+  build_fw_builder:
+    name: Build and push fw-builder Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    outputs:
+      image_hash: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Check out the repo
+        uses: actions/checkout@v3
+      - name: ghcr.io login
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ghcr.io/${{ github.repository }}-fw-builder
+      - name: Build and push Docker images
+        id: push
+        uses: docker/build-push-action@v4
+        with:
+          context: firmware
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+  build_fw:
+    name: Build firmware
+    runs-on: ubuntu-latest
+    needs: build_fw_builder
+    strategy:
+      matrix:
+        device_type: [ultra, lite]
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+      - name: Build firmware
+        env:
+          repo: ${{ github.repository }}
+        run: |
+          docker run --rm -v ${PWD}:/workdir -e CURRENT_DEVICE_TYPE=${{ matrix.device_type }} ghcr.io/${repo,,}-fw-builder@${{ needs.build_fw_builder.outputs.image_hash }} firmware/build.sh
+      - name: Upload built binaries
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.device_type }}-firmware
+          path: firmware/objects/*.hex
+      - name: Unzip dfu images
+        run: |
+          sudo chown -R $USER:$USER firmware/objects
+          mkdir firmware/objects/dfu-app
+          mkdir firmware/objects/dfu-full
+          unzip firmware/objects/dfu-app.zip -d firmware/objects/dfu-app
+          unzip firmware/objects/dfu-full.zip -d firmware/objects/dfu-full
+      - name: Upload dfu app image
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.device_type }}-dfu-app
+          path: firmware/objects/dfu-app/*
+      - name: Upload dfu full image
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.device_type }}-dfu-full
+          path: firmware/objects/dfu-full/*
+  create_release:
+    permissions: write-all
+    name: Create Pre-Release with dfu app images
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs:
+      - build_fw
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.run_number }}
+          release_name: Compiled commit ${{ github.sha }}
+          body: |
+            Auto-Generated DFU images
+          draft: false
+          prerelease: true
+      - name: Download Ultra DFU
+        uses: actions/download-artifact@v3
+        with:
+          name: ultra-dfu-app
+          path: dfu-app-artifacts
+      - name: Compress
+        run: |
+          zip --junk-paths -0 -r ./dfu-app-artifacts/dfu-app.zip ./dfu-app-artifacts/*
+      - name: Upload Ultra DFU
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./dfu-app-artifacts/dfu-app.zip
+          asset_name: ultra-dfu-app.zip
+          asset_content_type: application/zip
+      - name: Clear
+        run: |
+          rm -rf ./dfu-app-artifacts/
+      - name: Download Lite DFU
+        uses: actions/download-artifact@v3
+        with:
+          name: lite-dfu-app
+          path: dfu-app-artifacts
+      - name: Compress
+        run: |
+          zip --junk-paths -0 -r ./dfu-app-artifacts/dfu-app.zip ./dfu-app-artifacts/*
+      - name: Upload Lite DFU
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./dfu-app-artifacts/dfu-app.zip
+          asset_name: lite-dfu-app.zip
+          asset_content_type: application/zip
